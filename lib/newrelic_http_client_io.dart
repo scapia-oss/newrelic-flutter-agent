@@ -9,6 +9,7 @@ import 'dart:io';
 
 import 'package:newrelic_mobile/config.dart';
 import 'package:newrelic_mobile/newrelic_dt_trace.dart';
+import 'package:newrelic_mobile/src/tracked_headers.dart';
 
 import 'newrelic_mobile.dart';
 
@@ -234,41 +235,29 @@ Future<NewRelicHttpClientResponse> _wrapResponse(
   }
 
   return NewRelicHttpClientResponse(response, request, timestamp, traceData,
-      params: await _collectTrackedHeaders(request));
+      params: await _collectTrackedHeaders(request, response));
 }
 
-/// Collects the request headers the native agent asked to track.
+/// Collects the values of the headers the native agent asked to track, from
+/// both the request and the response: a header such as a backend request id is
+/// set by the server and never sent by the client.
 ///
 /// This observes the request the caller made, so it must never throw: failing
 /// here would reject the Future returned by close()/done and break the very
 /// request being instrumented. Anything unusable is skipped instead.
 Future<Map<String, String>> _collectTrackedHeaders(
-    HttpClientRequest request) async {
-  final params = <String, String>{};
-
+    HttpClientRequest request, HttpClientResponse response) async {
   dynamic headersList;
   try {
     headersList = await NewrelicMobile.instance.getHTTPHeadersTrackingFor();
   } catch (_) {
-    return params;
+    return <String, String>{};
   }
 
-  if (headersList is! Iterable) return params;
+  if (headersList is! Iterable) return <String, String>{};
 
-  for (final header in headersList) {
-    if (header is! String) continue;
-    try {
-      // operator[] returns every value, where value() throws on more than one.
-      final values = request.headers[header];
-      if (values == null || values.isEmpty) continue;
-      params[header] = values.join(', ');
-    } catch (_) {
-      // Invalid header field name -- lookup validates it the same way add()
-      // does, and addHTTPHeadersTrackingFor() does not.
-    }
-  }
-
-  return params;
+  return trackedHeaderParams(
+      headersList.whereType<String>(), request.headers, response.headers);
 }
 
 class NewRelicHttpClientRequest extends HttpClientRequest {
