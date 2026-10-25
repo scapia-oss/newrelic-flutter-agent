@@ -10,6 +10,13 @@ import NewRelic.NRLogger
 
 @objc(NewrelicMobilePlugin)
 public class NewrelicMobilePlugin: NSObject, FlutterPlugin {
+    /// Process-wide, like the agent's own list, so every engine sees names
+    /// registered by any of them. Only touched from `handle(_:result:)`, which runs
+    /// on the main thread because the channel is registered without a task queue;
+    /// add a lock if that ever changes. See TrackedHeaderList for why the agent's
+    /// list must not be read.
+    private static var trackedHeaders = TrackedHeaderList()
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "newrelic_mobile", binaryMessenger: registrar.messenger())
         let instance = NewrelicMobilePlugin()
@@ -208,11 +215,12 @@ public class NewrelicMobilePlugin: NSObject, FlutterPlugin {
             
             let headers = args!["headers"] as! [String]
             NewRelic.addHTTPHeaderTracking(for: headers)
+            NewrelicMobilePlugin.trackedHeaders.add(headers)
             result("headers added")
             
         case "getHTTPHeadersTrackingFor":
 
-            result(NewRelic.httpHeadersAddedForTracking())
+            result(NewrelicMobilePlugin.trackedHeaders.headers)
             
         case "noticeHttpTransaction":
             

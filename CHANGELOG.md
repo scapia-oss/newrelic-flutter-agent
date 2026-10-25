@@ -1,3 +1,9 @@
+### 1.2.9-hotfix-2
+
+## Bug Fixes
+
+- Fixed an iOS crash (`EXC_BAD_ACCESS`) in `getHTTPHeadersTrackingFor`. The plugin used to return `NewRelic.httpHeadersAddedForTracking()`, which reads the agent's tracked-header array without a lock while `noticeNetworkRequest(...andParams:)` replaces that array on a background queue. The plugin now keeps its own list of tracked header names (the agent's three defaults plus every name passed to `addHTTPHeadersTrackingFor`) and returns that instead. See FRONT-4292 and newrelic/newrelic-ios-agent#937.
+
 ### 1.2.9
 
 ## Enhancements
