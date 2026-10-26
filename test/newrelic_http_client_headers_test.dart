@@ -49,6 +49,10 @@ void main() {
   /// Deliberately Object? so tests can inject hostile channel payloads.
   Object? trackedHeaders;
 
+  /// Headers the loopback server adds to its response (fork, FRONT-3356).
+  /// Entries may repeat a name to send a header more than once.
+  List<MapEntry<String, String>> responseHeaders = [];
+
   setUpAll(() {
     NewrelicMobile.instance.setAgentConfiguration(Config(accessToken: ''));
 
@@ -70,6 +74,7 @@ void main() {
   setUp(() async {
     log.clear();
     trackedHeaders = <Object?>[];
+    responseHeaders = [];
 
     savedOverrides = HttpOverrides.current;
     HttpOverrides.global = null;
@@ -77,6 +82,9 @@ void main() {
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     server.listen((HttpRequest req) async {
       req.response.statusCode = 200;
+      for (final h in responseHeaders) {
+        req.response.headers.add(h.key, h.value);
+      }
       req.response.write('ok');
       await req.response.close();
     });
@@ -162,7 +170,10 @@ void main() {
             ..add('x-custom', 'b'));
 
       expectCleanRequest(r);
-      expect(recordedHttpParams(), containsPair('x-custom', 'a, b'));
+      // Fork (FRONT-3356): distinct values join with ';', not ', ', so a joined
+      // pair stays distinguishable from one folded header value. See
+      // trackedHeaderValueSeparator in lib/src/tracked_headers.dart.
+      expect(recordedHttpParams(), containsPair('x-custom', 'a;b'));
     });
 
     test('omits a tracked header the request does not carry', () async {
@@ -184,7 +195,52 @@ void main() {
             ..add('x-custom', 'b'));
 
       expectCleanRequest(r);
-      expect(recordedHttpParams(), containsPair('x-custom', 'a, b'));
+      // Fork (FRONT-3356): distinct values join with ';', not ', ', so a joined
+      // pair stays distinguishable from one folded header value. See
+      // trackedHeaderValueSeparator in lib/src/tracked_headers.dart.
+      expect(recordedHttpParams(), containsPair('x-custom', 'a;b'));
+    });
+  });
+
+  // Fork (FRONT-3356): a tracked header can be set by the server and never
+  // sent by the client (a backend request id), so the response is read too.
+  group('tracked header collection from the response (fork)', () {
+    test('captures a tracked header only the response carries', () async {
+      trackedHeaders = <Object?>['x-sc-request-id'];
+      responseHeaders = [const MapEntry('x-sc-request-id', 'req-123')];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(), containsPair('x-sc-request-id', 'req-123'));
+    });
+
+    test('merges the request and response values of one header, once each',
+        () async {
+      trackedHeaders = <Object?>['x-custom'];
+      responseHeaders = [
+        const MapEntry('x-custom', 'b'),
+        const MapEntry('x-custom', 'a'),
+      ];
+
+      final r = await get(prepare: (req) => req.headers.add('x-custom', 'a'));
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(), containsPair('x-custom', 'a;b'));
+    });
+
+    test('a repeated response header does not fail the request', () async {
+      trackedHeaders = <Object?>['x-sc-request-id'];
+      responseHeaders = [
+        const MapEntry('x-sc-request-id', 'one'),
+        const MapEntry('x-sc-request-id', 'two'),
+      ];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(r.status, 200);
+      expect(recordedHttpParams(), containsPair('x-sc-request-id', 'one;two'));
     });
   });
 
