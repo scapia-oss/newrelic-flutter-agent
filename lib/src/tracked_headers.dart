@@ -35,28 +35,3 @@ String? mergedTrackedHeaderValue(
   if (values.isEmpty) return null;
   return values.join(trackedHeaderValueSeparator);
 }
-
-/// Attributes for every header in [trackedHeaders] that either bag carries.
-///
-/// Best-effort: returns whatever it managed to collect rather than throwing.
-Map<String, String> trackedHeaderParams(
-  Iterable<String> trackedHeaders,
-  HttpHeaders requestHeaders,
-  HttpHeaders responseHeaders,
-) {
-  final params = <String, String>{};
-  for (final header in trackedHeaders) {
-    try {
-      final value =
-          mergedTrackedHeaderValue(requestHeaders, responseHeaders, header);
-      if (value == null) continue;
-      params[header] = value;
-    } catch (_) {
-      // Intentional, per header: one unusable name (lookup validates it the way
-      // add() does, and addHTTPHeadersTrackingFor() does not) must not drop the
-      // rest. See 'never breaks the response it observes' in
-      // test/tracked_headers_test.dart.
-    }
-  }
-  return params;
-}

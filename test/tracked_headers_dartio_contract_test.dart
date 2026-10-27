@@ -182,13 +182,12 @@ void main() {
 
     test('response-only header is captured', () async {
       final bags = await roundTrip(responseValues: ['abc']);
-      expect(trackedHeaderParams([kHeader], bags[0], bags[1]),
-          {kHeader: 'abc'});
+      expect(mergedTrackedHeaderValue(bags[0], bags[1], kHeader), 'abc');
     });
 
     test('absent on both sides writes no attribute', () async {
       final bags = await roundTrip();
-      expect(trackedHeaderParams([kHeader], bags[0], bags[1]), isEmpty);
+      expect(mergedTrackedHeaderValue(bags[0], bags[1], kHeader), isNull);
     });
 
     test('Content-Type identical on both sides collapses', () async {

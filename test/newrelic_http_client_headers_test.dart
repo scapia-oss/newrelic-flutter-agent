@@ -242,6 +242,29 @@ void main() {
       expect(r.status, 200);
       expect(recordedHttpParams(), containsPair('x-sc-request-id', 'one;two'));
     });
+
+    // Ported from the removed trackedHeaderParams unit tests: several tracked
+    // headers at once, each found on its own side, keyed exactly as registered.
+    test('each tracked header is read from whichever side carries it',
+        () async {
+      trackedHeaders = <Object?>['x-a', 'X-B'];
+      responseHeaders = [const MapEntry('x-b', '2')];
+
+      final r = await get(prepare: (req) => req.headers.add('x-a', '1'));
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(),
+          allOf(containsPair('x-a', '1'), containsPair('X-B', '2')));
+    });
+
+    test('an empty tracked list adds no attributes', () async {
+      responseHeaders = [const MapEntry('x-sc-request-id', 'req-123')];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams() ?? const {}, isEmpty);
+    });
   });
 
   group('hostile tracked-header input degrades gracefully', () {
