@@ -61,16 +61,6 @@ class FakeHttpHeaders implements HttpHeaders {
       throw UnimplementedError('${invocation.memberName} not needed by tests');
 }
 
-/// A bag that blows up on read, to prove the capture is best-effort.
-class ThrowingHttpHeaders implements HttpHeaders {
-  @override
-  List<String>? operator [](String name) =>
-      throw const FileSystemException('header bag exploded');
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError();
-}
-
 FakeHttpHeaders headers({
   List<String> entries = const [],
   List<String>? folded,
@@ -290,72 +280,4 @@ void main() {
       expect(mergedTrackedHeaderValue(h, empty, 'Header-1'), 'a;b');
     });
   });
-
-  group('trackedHeaderParams — building the attribute map', () {
-    test('one entry per tracked header that either bag carries', () {
-      final request = FakeHttpHeaders()..addEntry('x-a', '1');
-      final response = FakeHttpHeaders()..addEntry('x-b', '2');
-      expect(
-        trackedHeaderParams(['x-a', 'x-b'], request, response),
-        {'x-a': '1', 'x-b': '2'},
-      );
-    });
-
-    test('headers absent from both bags are omitted entirely', () {
-      // Not written as an empty string: an attribute that means "we looked and
-      // found nothing" would be indistinguishable from a real empty value.
-      expect(trackedHeaderParams(['x-missing'], empty, empty), isEmpty);
-    });
-
-    test('the attribute key is the tracked header name, untransformed', () {
-      // No renaming happens here. Which header to track is the app's decision
-      // via addHTTPHeadersTrackingFor, and the attribute name follows it, so
-      // this stays a general-purpose plugin rather than encoding one product's
-      // naming preference.
-      final response = FakeHttpHeaders()..addEntry('x-sc-request-id', 'abc');
-      expect(trackedHeaderParams(['x-sc-request-id'], empty, response),
-          {'x-sc-request-id': 'abc'});
-    });
-
-    test('an empty tracked list yields no attributes', () {
-      expect(trackedHeaderParams(const [], empty, empty), isEmpty);
-    });
-
-    test('never breaks the response it observes: a throwing bag is swallowed',
-        () {
-      // The guard that exists because the first version of this feature shipped
-      // a crash which failed real API calls. Losing an attribute is acceptable;
-      // failing the user's request is not.
-      expect(
-        () => trackedHeaderParams(['x-a'], ThrowingHttpHeaders(), empty),
-        returnsNormally,
-      );
-      expect(trackedHeaderParams(['x-a'], ThrowingHttpHeaders(), empty), isEmpty);
-    });
-
-    test('a mid-list failure keeps the attributes gathered before it', () {
-      // Best-effort, not all-or-nothing.
-      final ok = FakeHttpHeaders()..addEntry('x-a', '1');
-      var calls = 0;
-      final flaky = _FlakyOnSecondLookup(ok, () => ++calls);
-      expect(trackedHeaderParams(['x-a', 'x-b'], flaky, empty), {'x-a': '1'});
-    });
-  });
-}
-
-/// Succeeds once, then throws — used to show partial results are kept.
-class _FlakyOnSecondLookup implements HttpHeaders {
-  final FakeHttpHeaders _delegate;
-  final int Function() _tick;
-
-  _FlakyOnSecondLookup(this._delegate, this._tick);
-
-  @override
-  List<String>? operator [](String name) {
-    if (_tick() > 1) throw const FileSystemException('second lookup exploded');
-    return _delegate[name];
-  }
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError();
 }

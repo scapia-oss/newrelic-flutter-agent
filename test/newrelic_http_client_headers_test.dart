@@ -1,0 +1,392 @@
+/*
+ * Copyright (c) 2022-present New Relic Corporation. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+// Regression coverage for #222: instrumentation must never fail the request it
+// is observing when collecting tracked HTTP headers.
+//
+// These tests drive a real loopback HttpServer through a real HttpClient so the
+// real dart:io HttpHeaders is exercised. flutter_test's binding installs a stub
+// HttpClient whose _MockHttpHeaders.add() is a no-op and whose operator[]
+// returns const [], so the multi-value path cannot reproduce through it --
+// setUp clears HttpOverrides.global to get the real implementation back.
+
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:newrelic_mobile/config.dart';
+import 'package:newrelic_mobile/newrelic_http_client.dart';
+import 'package:newrelic_mobile/newrelic_mobile.dart';
+
+/// What one instrumented request did, split by propagation path.
+class Outcome {
+  /// Error that rejected the Future the caller awaited (close()/done).
+  final Object? callerError;
+
+  /// Errors that leaked as unhandled async errors -- in a real app these reach
+  /// the zone error handler / FlutterError.onError.
+  final List<Object> zoneErrors;
+  final int? status;
+
+  Outcome(this.callerError, this.zoneErrors, this.status);
+
+  @override
+  String toString() =>
+      'status=$status callerError=$callerError zoneErrors=$zoneErrors';
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late HttpServer server;
+  HttpOverrides? savedOverrides;
+  final List<MethodCall> log = <MethodCall>[];
+
+  /// Stands in for what the native agent reports as tracked headers.
+  /// Deliberately Object? so tests can inject hostile channel payloads.
+  Object? trackedHeaders;
+
+  /// Headers the loopback server adds to its response (fork, FRONT-3356).
+  /// Entries may repeat a name to send a header more than once.
+  List<MapEntry<String, String>> responseHeaders = [];
+
+  setUpAll(() {
+    NewrelicMobile.instance.setAgentConfiguration(Config(accessToken: ''));
+
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(const MethodChannel('newrelic_mobile'),
+            (MethodCall call) async {
+      log.add(call);
+      switch (call.method) {
+        case 'getHTTPHeadersTrackingFor':
+          return trackedHeaders;
+        case 'noticeDistributedTrace':
+          return <String, dynamic>{};
+        default:
+          return true;
+      }
+    });
+  });
+
+  setUp(() async {
+    log.clear();
+    trackedHeaders = <Object?>[];
+    responseHeaders = [];
+
+    savedOverrides = HttpOverrides.current;
+    HttpOverrides.global = null;
+
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((HttpRequest req) async {
+      req.response.statusCode = 200;
+      for (final h in responseHeaders) {
+        req.response.headers.add(h.key, h.value);
+      }
+      req.response.write('ok');
+      await req.response.close();
+    });
+  });
+
+  tearDown(() async {
+    await server.close(force: true);
+    HttpOverrides.global = savedOverrides;
+  });
+
+  Uri uri() => Uri.parse('http://127.0.0.1:${server.port}/');
+
+  /// Issues one instrumented GET, consuming the response body so telemetry is
+  /// flushed, and reports caller-visible vs leaked errors separately.
+  Future<Outcome> get(
+      {void Function(HttpClientRequest)? prepare,
+      bool alsoAwaitDone = false}) async {
+    final zoneErrors = <Object>[];
+    Object? callerError;
+    int? status;
+
+    final finished = Completer<void>();
+    runZonedGuarded(() async {
+      try {
+        final client = NewRelicHttpClient(client: HttpClient());
+        final request = await client.getUrl(uri());
+        if (prepare != null) prepare(request);
+        // done only completes once the request has been closed, so a caller
+        // using it must still call close().
+        final Future<HttpClientResponse>? done =
+            alsoAwaitDone ? request.done : null;
+        final response = await request.close();
+        status = response.statusCode;
+        await response.drain();
+        if (done != null) await done;
+      } catch (e) {
+        callerError = e;
+      }
+      if (!finished.isCompleted) finished.complete();
+    }, (e, _) => zoneErrors.add(e));
+
+    await finished.future;
+    // Let any leaked async error surface before we assert on it.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    return Outcome(callerError, zoneErrors, status);
+  }
+
+  List<MethodCall> callsTo(String method) =>
+      log.where((c) => c.method == method).toList();
+
+  Map<String, dynamic>? recordedHttpParams() {
+    final calls = callsTo('noticeHttpTransaction');
+    if (calls.isEmpty) return null;
+    final args = Map<String, dynamic>.from(calls.last.arguments as Map);
+    final params = args['params'];
+    return params == null ? null : Map<String, dynamic>.from(params as Map);
+  }
+
+  void expectCleanRequest(Outcome r) {
+    expect(r.callerError, isNull,
+        reason: 'instrumentation must not fail the caller\'s request');
+    expect(r.zoneErrors, isEmpty,
+        reason: 'instrumentation must not leak unhandled async errors');
+    expect(r.status, 200);
+  }
+
+  group('tracked header collection', () {
+    test('records a single-valued tracked header', () async {
+      trackedHeaders = <Object?>['x-custom'];
+
+      final r = await get(prepare: (req) => req.headers.add('x-custom', 'a'));
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(), containsPair('x-custom', 'a'));
+    });
+
+    test('joins a multi-valued tracked header instead of throwing', () async {
+      trackedHeaders = <Object?>['x-custom'];
+
+      final r = await get(
+          prepare: (req) => req.headers
+            ..add('x-custom', 'a')
+            ..add('x-custom', 'b'));
+
+      expectCleanRequest(r);
+      // Fork (FRONT-3356): distinct values join with ';', not ', ', so a joined
+      // pair stays distinguishable from one folded header value. See
+      // trackedHeaderValueSeparator in lib/src/tracked_headers.dart.
+      expect(recordedHttpParams(), containsPair('x-custom', 'a;b'));
+    });
+
+    test('omits a tracked header the request does not carry', () async {
+      trackedHeaders = <Object?>['x-absent'];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams() ?? const {}, isNot(contains('x-absent')));
+    });
+
+    test('a caller that also awaits done sees no error or leak', () async {
+      trackedHeaders = <Object?>['x-custom'];
+
+      final r = await get(
+          alsoAwaitDone: true,
+          prepare: (req) => req.headers
+            ..add('x-custom', 'a')
+            ..add('x-custom', 'b'));
+
+      expectCleanRequest(r);
+      // Fork (FRONT-3356): distinct values join with ';', not ', ', so a joined
+      // pair stays distinguishable from one folded header value. See
+      // trackedHeaderValueSeparator in lib/src/tracked_headers.dart.
+      expect(recordedHttpParams(), containsPair('x-custom', 'a;b'));
+    });
+  });
+
+  // Fork (FRONT-3356): a tracked header can be set by the server and never
+  // sent by the client (a backend request id), so the response is read too.
+  group('tracked header collection from the response (fork)', () {
+    test('captures a tracked header only the response carries', () async {
+      trackedHeaders = <Object?>['x-sc-request-id'];
+      responseHeaders = [const MapEntry('x-sc-request-id', 'req-123')];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(), containsPair('x-sc-request-id', 'req-123'));
+    });
+
+    test('merges the request and response values of one header, once each',
+        () async {
+      trackedHeaders = <Object?>['x-custom'];
+      responseHeaders = [
+        const MapEntry('x-custom', 'b'),
+        const MapEntry('x-custom', 'a'),
+      ];
+
+      final r = await get(prepare: (req) => req.headers.add('x-custom', 'a'));
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(), containsPair('x-custom', 'a;b'));
+    });
+
+    test('a repeated response header does not fail the request', () async {
+      trackedHeaders = <Object?>['x-sc-request-id'];
+      responseHeaders = [
+        const MapEntry('x-sc-request-id', 'one'),
+        const MapEntry('x-sc-request-id', 'two'),
+      ];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(r.status, 200);
+      expect(recordedHttpParams(), containsPair('x-sc-request-id', 'one;two'));
+    });
+
+    // Ported from the removed trackedHeaderParams unit tests: several tracked
+    // headers at once, each found on its own side, keyed exactly as registered.
+    test('each tracked header is read from whichever side carries it',
+        () async {
+      trackedHeaders = <Object?>['x-a', 'X-B'];
+      responseHeaders = [const MapEntry('x-b', '2')];
+
+      final r = await get(prepare: (req) => req.headers.add('x-a', '1'));
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(),
+          allOf(containsPair('x-a', '1'), containsPair('X-B', '2')));
+    });
+
+    test('an empty tracked list adds no attributes', () async {
+      responseHeaders = [const MapEntry('x-sc-request-id', 'req-123')];
+
+      final r = await get();
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams() ?? const {}, isEmpty);
+    });
+  });
+
+  group('hostile tracked-header input degrades gracefully', () {
+    test('invalid header field name does not fail the request', () async {
+      // operator[] runs the same _validateField as value(), which throws
+      // FormatException -- addHTTPHeadersTrackingFor does not validate input.
+      trackedHeaders = <Object?>['x custom'];
+
+      expectCleanRequest(await get());
+    });
+
+    test('non-String channel entry does not fail the request', () async {
+      trackedHeaders = <Object?>[42];
+
+      expectCleanRequest(await get());
+    });
+
+    test('null channel result does not fail the request', () async {
+      trackedHeaders = null;
+
+      expectCleanRequest(await get());
+    });
+
+    test('non-Iterable channel result does not fail the request', () async {
+      trackedHeaders = true;
+
+      expectCleanRequest(await get());
+    });
+
+    test('a good header is still captured alongside a bad one', () async {
+      trackedHeaders = <Object?>['x custom', 'x-good', 7];
+
+      final r = await get(prepare: (req) => req.headers.add('x-good', 'yes'));
+
+      expectCleanRequest(r);
+      expect(recordedHttpParams(), containsPair('x-good', 'yes'));
+    });
+  });
+
+  group('response wrapping is not duplicated', () {
+    test('reports exactly one transaction per request', () async {
+      trackedHeaders = <Object?>['x-custom'];
+
+      final r = await get(prepare: (req) => req.headers.add('x-custom', 'a'));
+
+      expectCleanRequest(r);
+      expect(callsTo('noticeHttpTransaction'), hasLength(1));
+    });
+
+    test('a connection failure is recorded once and surfaced to the caller',
+        () async {
+      // Point at a port nothing is listening on.
+      final closed = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final deadPort = closed.port;
+      await closed.close(force: true);
+
+      final zoneErrors = <Object>[];
+      Object? callerError;
+      final finished = Completer<void>();
+
+      runZonedGuarded(() async {
+        try {
+          final client = NewRelicHttpClient(client: HttpClient());
+          final request = await client
+              .getUrl(Uri.parse('http://127.0.0.1:$deadPort/'));
+          await request.close();
+        } catch (e) {
+          callerError = e;
+        }
+        if (!finished.isCompleted) finished.complete();
+      }, (e, _) => zoneErrors.add(e));
+
+      await finished.future;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(callerError, isNotNull,
+          reason: 'a real connection failure must still reach the caller');
+      expect(zoneErrors, isEmpty,
+          reason: 'the failure must not also leak as an unhandled async error');
+      expect(callsTo('recordError'), hasLength(1),
+          reason: 'the failure must be recorded once, not once per wrapper');
+    });
+  });
+
+  // #198 wrapped addStream in try/catch to swallow the StateError a cancelled
+  // request throws. _readAndRecreateStream is an async* generator, so its
+  // errors surface asynchronously through addStream's Future -- returning that
+  // Future without awaiting it inside the try meant catch never ran and the
+  // StateError escaped anyway. Analyzer flags this as
+  // unawaited_return_in_try_block.
+  group('addStream error handling', () {
+    /// Feeds [error] through an instrumented addStream and reports what the
+    /// caller saw.
+    Future<Object?> addStreamError(Object error) async {
+      final client = NewRelicHttpClient(client: HttpClient());
+      final request = await client.postUrl(uri());
+      try {
+        await request.addStream(Stream<List<int>>.error(error));
+        return null;
+      } catch (e) {
+        return e;
+      } finally {
+        // The request is left mid-stream; force-close tears it down without
+        // abort()'s asynchronous HttpException muddying the assertions.
+        client.close(force: true);
+      }
+    }
+
+    test('a StateError from a cancelled request does not reach the caller',
+        () async {
+      expect(await addStreamError(StateError('request was cancelled')), isNull,
+          reason: 'the #198 try/catch must actually swallow StateError');
+    });
+
+    test('a non-StateError is recorded and still surfaced to the caller',
+        () async {
+      final err = await addStreamError(const FormatException('bad payload'));
+
+      expect(err, isA<FormatException>(),
+          reason: 'errors other than StateError must still reach the caller');
+      expect(callsTo('recordError'), hasLength(1),
+          reason: 'reaching the catch block is what records the error');
+    });
+  });
+}

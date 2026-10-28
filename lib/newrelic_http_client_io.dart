@@ -9,6 +9,7 @@ import 'dart:io';
 
 import 'package:newrelic_mobile/config.dart';
 import 'package:newrelic_mobile/newrelic_dt_trace.dart';
+
 import 'package:newrelic_mobile/src/tracked_headers.dart';
 
 import 'newrelic_mobile.dart';
@@ -234,14 +235,46 @@ Future<NewRelicHttpClientResponse> _wrapResponse(
     return response;
   }
 
-  final List<String> headersList =
-      List<String>.from(await NewrelicMobile.instance.getHTTPHeadersTrackingFor());
-
-  final params =
-      trackedHeaderParams(headersList, request.headers, response.headers);
-
   return NewRelicHttpClientResponse(response, request, timestamp, traceData,
-      params: params);
+      params: await _collectTrackedHeaders(request, response));
+}
+
+/// Collects the headers the native agent asked to track.
+///
+/// Fork (FRONT-3356): reads the response as well as the request, since a header
+/// such as a backend request id is set by the server and never sent by the
+/// client. Value rules live in lib/src/tracked_headers.dart.
+///
+/// This observes the request the caller made, so it must never throw: failing
+/// here would reject the Future returned by close()/done and break the very
+/// request being instrumented. Anything unusable is skipped instead.
+Future<Map<String, String>> _collectTrackedHeaders(
+    HttpClientRequest request, HttpClientResponse response) async {
+  final params = <String, String>{};
+
+  dynamic headersList;
+  try {
+    headersList = await NewrelicMobile.instance.getHTTPHeadersTrackingFor();
+  } catch (_) {
+    return params;
+  }
+
+  if (headersList is! Iterable) return params;
+
+  for (final header in headersList) {
+    if (header is! String) continue;
+    try {
+      final value =
+          mergedTrackedHeaderValue(request.headers, response.headers, header);
+      if (value == null) continue;
+      params[header] = value;
+    } catch (_) {
+      // Invalid header field name -- lookup validates it the same way add()
+      // does, and addHTTPHeadersTrackingFor() does not.
+    }
+  }
+
+  return params;
 }
 
 class NewRelicHttpClientRequest extends HttpClientRequest {
@@ -253,21 +286,7 @@ class NewRelicHttpClientRequest extends HttpClientRequest {
 
   NewRelicHttpClientRequest(
       this._httpClientRequest, this.timestamp, this.traceData,
-      [this.params]) {
-    var request = this;
-    request.done.then((value) {
-      var response = _wrapResponse(
-        value,
-        request,
-        this.timestamp,
-        this.traceData,
-      );
-      return response;
-    }, onError: (dynamic err) {
-      NewrelicMobile.instance.recordError(err, StackTrace.current);
-      throw err;
-    });
-  }
+      [this.params]);
 
   void _checkAndResetBufferIfRequired() {
     if (_sendBuffer != null && _sendBuffer!.length > 2048) {
@@ -318,7 +337,11 @@ class NewRelicHttpClientRequest extends HttpClientRequest {
   Future addStream(Stream<List<int>> stream) async {
     try {
       var newStream = _readAndRecreateStream(stream);
-      return _httpClientRequest.addStream(newStream);
+      // await, not a bare return: _readAndRecreateStream is an async*
+      // generator, so its errors arrive through this Future. Returning it
+      // unawaited leaves the try block before they surface, so catch never
+      // runs and the StateError below escapes to the caller.
+      return await _httpClientRequest.addStream(newStream);
     } catch (err, stackTrace) {
       // Silently handle stream closure errors to prevent app crashes
       if (err is StateError) {

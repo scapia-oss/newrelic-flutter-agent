@@ -53,7 +53,7 @@ void main() {
   const megaBytes = 100;
   const maxBufferTime = 300;
   const metricUnitBytes = "bytes";
-  const agentVersion = "1.2.9";
+  const agentVersion = "1.3.4";
   const traceData = {
     "id": "1",
     "guid": "2",
@@ -551,6 +551,55 @@ void main() {
       'responseBody': responseBody,
       'traceAttributes': null,
       'params': null
+    };
+    expect(methodCalLogs, <Matcher>[
+      isMethodCall(
+        'noticeHttpTransaction',
+        arguments: params,
+      )
+    ]);
+  });
+
+  test(
+      'test noticeHttpTransaction should omit the newrelic trace attribute on iOS Platform when native does not provide one',
+      () async {
+    var platformManger = MockPlatformManager();
+    PlatformManager.setPlatformInstance(platformManger);
+    when(platformManger.isAndroid()).thenAnswer((realInvocation) => false);
+    when(platformManger.isIOS()).thenAnswer((realInvocation) => true);
+
+    final traceDataWithoutNewrelicHeader = {
+      DTTraceTags.traceState: traceData[DTTraceTags.traceState],
+      DTTraceTags.traceParent: traceData[DTTraceTags.traceParent],
+    };
+
+    await NewrelicMobile.instance.noticeHttpTransaction(
+        url,
+        httpMethod,
+        statusCode,
+        startTime,
+        endTime,
+        bytesSent,
+        bytesReceived,
+        traceDataWithoutNewrelicHeader,
+        responseBody: responseBody,
+        httpParams: httpParams);
+
+    final traceAttributes = {
+      DTTraceTags.traceParent: traceData[DTTraceTags.traceParent],
+      DTTraceTags.traceState: traceData[DTTraceTags.traceState],
+    };
+    final Map<String, dynamic> params = <String, dynamic>{
+      'url': url,
+      'httpMethod': httpMethod,
+      'statusCode': statusCode,
+      'startTime': startTime,
+      'endTime': endTime,
+      'bytesSent': bytesSent,
+      'bytesReceived': bytesReceived,
+      'responseBody': responseBody,
+      'traceAttributes': traceAttributes,
+      'params': httpParams
     };
     expect(methodCalLogs, <Matcher>[
       isMethodCall(

@@ -111,7 +111,7 @@ public class NewrelicMobilePlugin: NSObject, FlutterPlugin {
             
             NewRelic.setPlatform(NRMAApplicationPlatform.platform_Flutter)
             let selector = NSSelectorFromString("setPlatformVersion:")
-            NewRelic.perform(selector, with:"1.2.9")
+            NewRelic.perform(selector, with:"1.3.4")
             
             if collectorAddress == nil && crashCollectorAddress == nil {
                 NewRelic.start(withApplicationToken: applicationToken!)
@@ -225,7 +225,7 @@ public class NewrelicMobilePlugin: NSObject, FlutterPlugin {
             let bytesReceived = args!["bytesReceived"] as! NSNumber
             let responseBody = args!["responseBody"] as! NSString
             let traceHeaders = args?["traceAttributes"] as? [String : Any] ?? [:]
-            let httpParams = HttpParamsNormalizer.normalize(args?["params"])
+            let httpParams = args?["params"] as? [String : Any]
 
             NewRelic.noticeNetworkRequest(for: URL.init(string: url), httpMethod: httpMethod, startTime: Double(truncating: startTime), endTime: Double(truncating: endTime), responseHeaders: nil, statusCode: statusCode, bytesSent: UInt(truncating: bytesSent), bytesReceived: UInt(truncating: bytesReceived), responseData: responseBody.data(using: String.Encoding.utf8.rawValue), traceHeaders: traceHeaders, andParams: httpParams)
             result(true)
@@ -298,8 +298,10 @@ public class NewrelicMobilePlugin: NSObject, FlutterPlugin {
             result("Crash triggered")
         default:
             result(FlutterMethodNotImplemented)
-
+            
+            
+            
         }
-
+        
     }
 }
